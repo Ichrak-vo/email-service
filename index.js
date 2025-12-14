@@ -2,27 +2,24 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import nodemailer from 'nodemailer';
+import dns from 'dns';
 
 dotenv.config();
 
+// ✅ Important: force IPv4 first (souvent nécessaire en cloud)
+dns.setDefaultResultOrder('ipv4first');
+
 const app = express();
-const port = process.env.PORT || 4000;
+const appPort = process.env.PORT || 4000;
 
 app.use(
   cors({
-    origin: '*', // en prod : ['https://vonoy.co', 'https://ton-site.vercel.app']
+    origin: '*', // en prod: mets ton domaine front uniquement
   })
 );
 app.use(express.json());
 
-const esc = (s = '') =>
-  String(s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-
-// ---- Templates simples (tu peux remettre tes versions HTML si tu veux) ----
+// ---- Templates ----
 function supportText(d) {
   return `Dear support,
 
@@ -56,12 +53,10 @@ If anything is incorrect, just reply to this email.
 — Vonoy Team`;
 }
 
-// Petite route test
 app.get('/', (_req, res) => {
-  res.send('Vonoy SMTP email service is running ✅');
+  res.send('Vonoy SMTP email service is running');
 });
 
-// Route principale
 app.post('/send-email', async (req, res) => {
   const {
     email,
@@ -75,46 +70,47 @@ app.post('/send-email', async (req, res) => {
     message = '',
   } = req.body || {};
 
-  // 1) Validation des champs
+  // 1) Validation
   const required = { email, firstName, lastName, companyName, country, fleetSize, industry };
   const missing = Object.entries(required)
     .filter(([, v]) => !v || String(v).trim() === '')
     .map(([k]) => k);
 
   if (missing.length) {
-    console.warn('[send-email] Missing fields:', missing);
     return res.status(400).json({ ok: false, message: `Missing fields: ${missing.join(', ')}` });
   }
 
-  // 2) Vérifier la config SMTP
+  // 2) Env SMTP
   const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SUPPORT_INBOX } = process.env;
 
   if (!SMTP_HOST || !SMTP_PORT || !SMTP_USER || !SMTP_PASS || !SUPPORT_INBOX) {
-    console.error('[send-email] Missing SMTP config env vars');
-    return res.status(500).json({
-      ok: false,
-      message: 'SMTP configuration is missing on the server.',
-    });
+    return res.status(500).json({ ok: false, message: 'SMTP configuration is missing on the server.' });
   }
 
-  const port = Number(SMTP_PORT);
-  const secure = port === 465; // en général 465 = SSL, 587 = STARTTLS
+  const smtpPort = Number(SMTP_PORT);
+  const is465 = smtpPort === 465;
 
   console.log('[send-email] Creating transporter:', {
     host: SMTP_HOST,
-    port,
-    secure,
+    port: smtpPort,
+    secure: is465,
     user: SMTP_USER,
   });
 
   const transporter = nodemailer.createTransport({
     host: SMTP_HOST,
-    port,
-    secure,
-    auth: {
-      user: SMTP_USER,
-      pass: SMTP_PASS,
+    port: smtpPort,
+    secure: is465, // 465 = SSL, 587 = STARTTLS
+    auth: { user: SMTP_USER, pass: SMTP_PASS },
+    // STARTTLS recommandé pour 587
+    requireTLS: smtpPort === 587,
+    tls: {
+      minVersion: 'TLSv1.2',
+      servername: SMTP_HOST,
     },
+    connectionTimeout: 20_000,
+    greetingTimeout: 20_000,
+    socketTimeout: 20_000,
   });
 
   const data = {
@@ -130,20 +126,22 @@ app.post('/send-email', async (req, res) => {
   };
 
   try {
-    // 3) Email vers le support
+    // ✅ Diagnostic avant envoi
+    console.log('[send-email] Verifying SMTP connection...');
+    await transporter.verify();
+    console.log('[send-email] SMTP verify OK');
+
     console.log('[send-email] Sending support email...');
     const infoSupport = await transporter.sendMail({
-      from: `"Vonoy Support" <${SMTP_USER}>`, // adresse d’envoi = ton SMTP_USER
-      to: SUPPORT_INBOX, // destination support
+      from: `"Vonoy Support" <${SMTP_USER}>`,
+      to: SUPPORT_INBOX,
       replyTo: `"${data.firstName} ${data.lastName}" <${data.email}>`,
       subject: `New Demo Request — ${data.firstName} ${data.lastName} (${data.companyName})`,
       text: supportText(data),
-      // html: supportHtml(data), // si tu veux ajouter ta version HTML
     });
 
     console.log('[send-email] Support email sent, id:', infoSupport.messageId);
 
-    // 4) Email de confirmation à l’utilisateur
     console.log('[send-email] Sending user confirmation email...');
     const infoUser = await transporter.sendMail({
       from: `"Vonoy Team" <${SMTP_USER}>`,
@@ -151,7 +149,6 @@ app.post('/send-email', async (req, res) => {
       replyTo: SUPPORT_INBOX,
       subject: `Thanks ${data.firstName}, we received your demo request`,
       text: userText(data),
-      // html: userHtml(data),
     });
 
     console.log('[send-email] User email sent, id:', infoUser.messageId);
@@ -171,6 +168,6 @@ app.post('/send-email', async (req, res) => {
   }
 });
 
-app.listen(port, () => {
-  console.log(`SMTP email service listening on port ${port}`);
+app.listen(appPort, () => {
+  console.log(`SMTP email service listening on port ${appPort}`);
 });
